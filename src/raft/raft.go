@@ -65,8 +65,9 @@ const (
 
 const (
 	leaderHeartbeatTime time.Duration = 100 * time.Millisecond
-	minElectionTimeout time.Duration = 450 * time.Millisecond
-	maxElectionTimeout time.Duration = 600 * time.Millisecond
+	minElectionTimeout time.Duration = 800 * time.Millisecond
+	maxElectionTimeout time.Duration = 1000 * time.Millisecond
+	maxRPCTimeout time.Duration = 100 * time.Millisecond
 )
 
 //
@@ -115,6 +116,21 @@ func (rf *Raft) lastLogTerm() int {
 
 func (rf *Raft) lastLogIndex() int {
 	return len(rf.logs)
+}
+
+func (rf *Raft) getLogsStartFrom(index int) []LogEntry {
+	if index == 0 {
+		return []LogEntry{}
+	}
+	return rf.logs[index - 1:]
+}
+
+func (rf *Raft) dropLogsFrom(index int) {
+	if index == 0 {
+		DPrintf("server %d: can't drop index 0 log, it's virtual!\n", rf.me)
+		panic(1)
+	}
+	rf.logs = rf.logs[:index - 1]
 }
 
 // return currentTerm and whether this server
@@ -239,6 +255,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.role = RaftFollower
+		rf.lastHeartbeat = time.Now()
 		DPrintf("server %d updated term %d. retrieved vote.", rf.me, rf.currentTerm)
 	}
 	if rf.votedFor != -1 {
@@ -340,104 +357,94 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		rf.mu.Lock()
-		if rf.role == RaftLeader {
-			rf.mu.Unlock()
-			time.Sleep(leaderHeartbeatTime)
-			rf.mu.Lock()
-			appendResults := make([]AppendEntriesReply, len(rf.peers))
-			for i := 0; i < len(rf.peers); i++ {
-				if i == rf.me {
-					continue
-				}
-				appendArgs := AppendEntriesArgs {
-					Term: rf.currentTerm,
-					LeaderId: rf.me,
-					PrevLogIndex: rf.matchIndex[i],
-					PrevLogTerm: rf.logTerm(rf.matchIndex[i]),
-					Entries: rf.logs[rf.nextIndex[i]:],
-					LeaderCommit: rf.commitIndex,
-				}
-				rf.mu.Unlock()
-				rf.sendAppendEntries(i, &appendArgs, &appendResults[i])
-				rf.mu.Lock()
-				if appendResults[i].Term > rf.currentTerm {
-					rf.role = RaftFollower
-					rf.currentTerm = appendResults[i].Term
-					rf.votedFor = -1
-					DPrintf("server %d: The server %d has greater term %d, give up leadership.", rf.me, i, appendResults[i].Term)
-					break
-				}
-				if !appendResults[i].Success {
-					DPrintf("server %d: The server %d append entries failed.", rf.me, i)
-					rf.nextIndex[i] = maxInt(0, rf.nextIndex[i] - 1)
-					rf.matchIndex[i] = maxInt(0, rf.matchIndex[i] - 1)
-					DPrintf("leader %d: The server nextIdx: %d, matchIdx: %d.", rf.me, rf.nextIndex[i], rf.matchIndex[i])
-				}
-			}
-			rf.mu.Unlock()
-		} else if rf.role == RaftFollower {
-			preHeartbeat := rf.lastHeartbeat
-			rf.mu.Unlock()
-			time.Sleep(getRandomElectionTime())
-			rf.mu.Lock()
-			if int(rf.lastHeartbeat.Sub(preHeartbeat)) <= 0 {
-				DPrintf("server %d: election timeout, starting election.", rf.me)
-				rf.electOnce()
-			}
-			rf.mu.Unlock()
-		} else {
-			rf.mu.Unlock()
-			time.Sleep(getRandomElectionTime())
-			DPrintf("server %d: re-electing...", rf.me)
-			rf.mu.Lock()
+		preHeartbeat := rf.lastHeartbeat
+		rf.mu.Unlock()
+		time.Sleep(getRandomElectionTime())
+		rf.mu.Lock()
+		role := rf.role
+		heartbeat := int(rf.lastHeartbeat.Sub(preHeartbeat))
+		rf.mu.Unlock()
+		if role == RaftLeader {
+			DPrintf("server %d: I'm leader, election timeout skipped.\n", rf.me)
+			continue
+		}
+		if heartbeat <= 0 {
+			DPrintf("server %d: election timeout, starting election.", rf.me)
 			rf.electOnce()
-			rf.mu.Unlock()
 		}
 	}
 }
 
 func (rf *Raft) electOnce() {
+	rf.mu.Lock()
 	rf.role = RaftCandidate
-	DPrintf("server %d: starting election.", rf.me)
+	DPrintf("server %d: starting election.\n", rf.me)
 	rf.currentTerm++
 	rf.votedFor = rf.me
-	DPrintf("server %d: Term: %d, voted its self.", rf.me, rf.currentTerm)
-	voteArgs := RequestVoteArgs {
+	DPrintf("server %d: Term: %d, voted its self.\n", rf.me, rf.currentTerm)
+	ch := make(chan int, len(rf.peers))
+	args := RequestVoteArgs {
 		Term: rf.currentTerm,
 		CandidateId: rf.me,
 		LastLogIndex: rf.lastLogIndex(),
 		LastLogTerm: rf.lastLogTerm(),
 	}
-	voteResults := make([]RequestVoteReply, len(rf.peers))
+	rf.mu.Unlock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		rf.mu.Unlock()
-		ok := rf.sendRequestVote(i, &voteArgs, &voteResults[i])
-		if !ok {
-			DPrintf("server %d: send vote request to server %d failed.", rf.me, i)
-		}
-		rf.mu.Lock()
+		go func(i int) {
+			req := args
+			rsp := RequestVoteReply{}
+			ok := rf.sendRequestVote(i, &req, &rsp)
+			if !ok {
+				ch <- 0
+			}
+			if rsp.Term > req.Term {
+				ch <- -1
+			} else if rsp.VoteGrand {
+				ch <- 1
+			} else {
+				ch <- 0
+			}
+		}(i)
 	}
-	winCnt := 1
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		if voteResults[i].Term > rf.currentTerm {
-			rf.currentTerm = voteResults[i].Term
+	go func() {
+		time.Sleep(maxRPCTimeout)
+		ch <- -100
+	}()
+	rf.mu.Lock()
+	if rf.currentTerm != args.Term || rf.role != RaftCandidate {
+		return
+	}
+	rf.mu.Unlock()
+	votes := 1
+	for i := 0; i < len(rf.peers) - 1; i++ {
+		vote := <-ch
+		if vote == -1 {
+			rf.mu.Lock()
 			rf.role = RaftFollower
-			DPrintf("server %d: server %d is relative new, election failed.", rf.me, i)
+			rf.votedFor = -1
+			DPrintf("server %d: give up election, become follower, retrieved vote.\n", rf.me)
+			rf.mu.Unlock()
+			return
+		} else if vote == 1 {
+			votes++
+			if votes > len(rf.peers) / 2 {
+				rf.mu.Lock()
+				rf.role = RaftLeader
+				go rf.leaderTicker()
+				DPrintf("server %d: I have become leader.\n", rf.me)
+				rf.mu.Unlock()
+				return
+			}
+		} else if vote == -100 {
+			rf.mu.Lock()
+			DPrintf("server %d: vote rpc timeout. server %d and later server all failed.\n", rf.me, i)
+			rf.mu.Unlock()
 			return
 		}
-		if voteResults[i].VoteGrand {
-			winCnt++
-		}
-	}
-	if winCnt >= (len(rf.peers) + 1) / 2 {
-		rf.role = RaftLeader
-		DPrintf("server %d: won the election.", rf.me)
 	}
 }
 
@@ -471,7 +478,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	for i := 0; i < len(peers); i++ {
-		rf.nextIndex[i] = 0
+		rf.nextIndex[i] = 1
 		rf.matchIndex[i] = 0
 	}
 
@@ -538,7 +545,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	reply.Success = true
-	rf.logs = rf.logs[:args.PrevLogIndex]
+	rf.dropLogsFrom(args.PrevLogIndex + 1)
 	rf.logs = append(rf.logs, args.Entries...)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = minInt(args.LeaderCommit, rf.lastLogIndex())
@@ -549,6 +556,94 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func getRandomElectionTime() time.Duration {
 		randomTime := minElectionTimeout + time.Duration(rand.Int63n(int64((maxElectionTimeout - minElectionTimeout) / time.Millisecond))) * time.Millisecond
 		return randomTime
+}
+
+
+type leaderAppendEntriesLog struct {
+	Sent bool
+	Request AppendEntriesArgs
+	Result AppendEntriesReply
+}
+
+func (rf *Raft) leaderTicker() {
+	for !rf.killed() {
+		time.Sleep(leaderHeartbeatTime)
+		rf.mu.Lock()
+		if rf.role != RaftLeader {
+			rf.mu.Unlock()
+			break
+		}
+		DPrintf("server %d: leader ticking...\n", rf.me)
+		appendEntriesLogs := make([]leaderAppendEntriesLog, len(rf.peers))
+		waitCh := make(chan int)
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			appendEntriesLogs[i].Sent = false
+			appendEntriesLogs[i].Request = AppendEntriesArgs{
+				Term: rf.currentTerm,
+				LeaderId: rf.me,
+				PrevLogIndex: rf.matchIndex[i],
+				PrevLogTerm: rf.logTerm(rf.matchIndex[i]),
+				Entries: rf.getLogsStartFrom(rf.nextIndex[i]),
+				LeaderCommit: rf.commitIndex,
+			}
+		}
+		rf.mu.Unlock()
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			go func(i int) {
+				DPrintf("server %d: sending AppendEntries to server %d.\n", rf.me, i)
+				ok := rf.sendAppendEntries(i, &appendEntriesLogs[i].Request, &appendEntriesLogs[i].Result)
+				if ok {
+					appendEntriesLogs[i].Sent = true
+					DPrintf("server %d: sent AppendEntries to server %d.\n", rf.me, i)
+				} else {
+					DPrintf("server %d: can't send AppendEntries to server %d.\n", rf.me, i)
+				}
+				waitCh <- i
+			}(i)
+		}
+		go func () {
+			// rpc timeout monitor
+			time.Sleep(maxRPCTimeout)
+			waitCh <- -1
+		}()
+		for j := 0; j < len(rf.peers) - 1; j++ {
+			i := <- waitCh
+			rf.mu.Lock()
+			if i < 0 {
+				DPrintf("server %d: server %d and later append failed, rpc timeout.\n", rf.me, j)
+				rf.mu.Unlock()
+				break
+			}
+			if !appendEntriesLogs[i].Sent {
+				rf.mu.Unlock()
+				continue
+			}
+			if appendEntriesLogs[i].Result.Term > rf.currentTerm {
+				rf.currentTerm = appendEntriesLogs[i].Result.Term
+				rf.role = RaftFollower
+				rf.votedFor = -1
+				rf.mu.Unlock()
+				DPrintf("server %d: give up leading, become follower, retrieved vote.\n", rf.me)
+				break
+			}
+			if !appendEntriesLogs[i].Result.Success {
+				rf.matchIndex[i] = maxInt(rf.matchIndex[i], 0)
+				rf.nextIndex[i] = maxInt(rf.nextIndex[i], 1)
+				DPrintf("server %d: append server %d failed. its matchIndex: %d, its nextIndex: %d.\n", rf.me, i, rf.matchIndex[i], rf.nextIndex[i])
+			} else {
+				rf.matchIndex[i] = appendEntriesLogs[i].Request.PrevLogIndex + len(appendEntriesLogs[i].Request.Entries)
+				rf.nextIndex[i] = rf.matchIndex[i] + 1
+				DPrintf("server %d: append server %d successfully. its matchIndex: %d, its nextIndex: %d.\n", rf.me, i, rf.matchIndex[i], rf.nextIndex[i])
+			}
+			rf.mu.Unlock()
+		}
+	}
 }
 
 func maxInt(a, b int) int {
