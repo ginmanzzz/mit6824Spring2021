@@ -98,6 +98,7 @@ type Raft struct {
 	
 	// other
 	lastHeartbeat time.Time
+	applyCh chan ApplyMsg
 }
 
 func (rf *Raft) logTerm(index int) int {
@@ -131,6 +132,32 @@ func (rf *Raft) dropLogsFrom(index int) {
 		panic(1)
 	}
 	rf.logs = rf.logs[:index - 1]
+}
+
+func (rf *Raft) overMajorityPersisted(index int) bool {
+	if index == 0 {
+		return true
+	}
+	cnt := 1
+	for i := 0; i < len(rf.peers) && cnt <= len(rf.peers) / 2; i++ {
+		if i == rf.me {
+			continue
+		}
+		if rf.matchIndex[i] >= index {
+			cnt++
+		}
+	}
+	return cnt > len(rf.peers) / 2
+}
+
+func (rf *Raft) logAt(index int) LogEntry {
+	if (index == 0) {
+		return LogEntry {
+			Command: nil,
+			Term: rf.currentTerm,
+		}
+	}
+	return rf.logs[index - 1]
 }
 
 // return currentTerm and whether this server
@@ -322,8 +349,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != RaftLeader {
+		return index, term, false
+	}
+	index = rf.lastLogIndex() + 1
+	term = rf.currentTerm
+	isLeader = true
+	rf.logs = append(rf.logs, LogEntry{command, term})
+	DPrintf("server %d: append log index %d, term %d, cmd: %v.\n", rf.me, index, term, command)
 	return index, term, isLeader
 }
 
@@ -483,6 +518,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	rf.lastHeartbeat = time.Now()
+	rf.applyCh = applyCh
 	DPrintf("making raft server.")
 
 	// initialize from state persisted before a crash
@@ -548,7 +584,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.dropLogsFrom(args.PrevLogIndex + 1)
 	rf.logs = append(rf.logs, args.Entries...)
 	if args.LeaderCommit > rf.commitIndex {
+		preCommit := rf.commitIndex
 		rf.commitIndex = minInt(args.LeaderCommit, rf.lastLogIndex())
+		for i := preCommit + 1; i <= rf.commitIndex; i++ {
+			rf.applyCh <- ApplyMsg {
+				CommandValid: true,
+				Command: rf.logAt(i).Command,
+				CommandIndex: i,
+			}
+		}
+		DPrintf("server %d: updated follower commit index %d.\n", rf.me, rf.commitIndex)
 	}
 	DPrintf("server %d: leader %d append successfully.", rf.me, args.LeaderId)
 }
@@ -633,13 +678,26 @@ func (rf *Raft) leaderTicker() {
 				break
 			}
 			if !appendEntriesLogs[i].Result.Success {
-				rf.matchIndex[i] = maxInt(rf.matchIndex[i], 0)
-				rf.nextIndex[i] = maxInt(rf.nextIndex[i], 1)
+				rf.matchIndex[i] = maxInt(rf.matchIndex[i] - 1, 0)
+				rf.nextIndex[i] = maxInt(rf.nextIndex[i] - 1, 1)
 				DPrintf("server %d: append server %d failed. its matchIndex: %d, its nextIndex: %d.\n", rf.me, i, rf.matchIndex[i], rf.nextIndex[i])
 			} else {
 				rf.matchIndex[i] = appendEntriesLogs[i].Request.PrevLogIndex + len(appendEntriesLogs[i].Request.Entries)
 				rf.nextIndex[i] = rf.matchIndex[i] + 1
 				DPrintf("server %d: append server %d successfully. its matchIndex: %d, its nextIndex: %d.\n", rf.me, i, rf.matchIndex[i], rf.nextIndex[i])
+				for k := rf.commitIndex + 1; k <= rf.matchIndex[i]; k++ {
+					DPrintf("server %d: checking log index %d whether over majority.\n", rf.me, k)
+					if !rf.overMajorityPersisted(k) {
+						break
+					}
+					rf.commitIndex++
+					DPrintf("leader server %d: updated commitIndex: %d", rf.me, rf.commitIndex)
+					rf.applyCh <- ApplyMsg {
+						CommandValid: true,
+						Command: rf.logAt(k).Command,
+						CommandIndex: k,
+					}
+				}
 			}
 			rf.mu.Unlock()
 		}
@@ -659,3 +717,5 @@ func minInt(a, b int) int {
 	}
 	return b
 }
+
+
